@@ -56,6 +56,9 @@ vectorstore = None          # Chroma VectorStore 객체
 prompt_template = None      # ChatPromptTemplate 객체 (RAG 전용)
 prompt_template_general = None  # ChatPromptTemplate 객체 (일반 대화용)
 rag_workflow = None         # 컴파일된 LangGraph RAG 에이전트 애플리케이션
+prompt_template_fishing = None  # ChatPromptTemplate 객체 (낚시 지역 RAG 전용)
+prompt_template_fishing_general = None  # ChatPromptTemplate 객체 (낚시 일반지식 폴백용)
+fishing_workflow = None     # 컴파일된 낚시 지역 RAG 워크플로우
 
 
 # ==========================================
@@ -155,6 +158,227 @@ def build_rag_graph():
     # END
 
 # ==========================================
+# [낚시 지역 RAG] 지역 선택 기반 낚시 정보 RAG
+#  - 기존 RAG 워크플로우(build_rag_graph)는 그대로 두고, 낚시 전용 그래프를 따로 둔다.
+#  - index_fishing.html에서 도/시를 고르면 그 지역명이 검색 쿼리와 프롬프트에 함께 들어간다.
+# ==========================================
+# 멀티턴 대화용 (기존 import 줄은 건드리지 않고 이 블록에서만 추가로 가져온다)
+from langchain_core.prompts import MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+
+FISHING_TOP_K = 8          # 낚시 질문은 규제+낚시터+포인트를 함께 봐야 해서 넉넉히 검색
+FISHING_MIN_SCORE = 0.20   # 이 점수에 못 미치면 '검색 실패'로 보고 LLM 일반지식으로 답한다
+FISHING_HISTORY_MAX = 8    # 직전 8개 메시지(약 4턴)까지 대화 맥락으로 사용
+
+
+class FishingRAGState(TypedDict):
+    question: str      # 사용자 질문 원문
+    region: str        # 선택한 시/도 (예: 경상남도)
+    city: str          # 선택한 시/군/구 (예: 김해시)
+    history: list      # 이전 대화 [{"role": "user"|"assistant", "content": "..."}]
+    use_rag: bool      # RAG 검색 사용 여부
+    context: str       # 검색으로 조립된 참고 문서
+    sources: str       # 출처 파일명 목록
+    mode: str          # "rag"(업로드 문서 근거) 또는 "llm"(모델 일반지식)
+    answer: str        # 최종 답변
+
+
+def to_lc_messages(history) -> list:
+    """프런트에서 온 대화 기록을 LangChain 메시지로 변환한다."""
+    messages = []
+    for item in (history or [])[-FISHING_HISTORY_MAX:]:
+        if not isinstance(item, dict):
+            continue
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        role = (item.get("role") or "").lower()
+        messages.append(AIMessage(content=content) if role in ("assistant", "ai", "bot")
+                        else HumanMessage(content=content))
+    return messages
+
+
+def fishing_retrieve_node(state: FishingRAGState) -> FishingRAGState:
+    """[Fishing Retrieve]: 선택 지역명을 검색 쿼리에 결합해 낚시 관련 문서를 모은다."""
+    question = state["question"]
+    place = " ".join(x for x in (state.get("region", ""), state.get("city", "")) if x).strip()
+
+    # 지역이 선택되면 '질문 / 규제 / 낚시터·포인트' 3방향으로 나눠 검색해 회수율을 높인다.
+    if place:
+        queries = [
+            f"{place} {question}",
+            f"{place} 낚시금지구역 낚시제한구역 낚시통제구역",
+            f"{place} 낚시터 낚시포인트 주요어종",
+        ]
+    else:
+        queries = [question]
+
+    collected: Dict[str, Any] = {}
+    for query in queries:
+        for doc, score in vectorstore.similarity_search_with_relevance_scores(
+            query, k=FISHING_TOP_K, score_threshold=0.00
+        ):
+            key = doc.page_content
+            if key not in collected or score > collected[key][1]:
+                collected[key] = (doc, score)
+
+    ranked = sorted(collected.values(), key=lambda pair: pair[1], reverse=True)[:FISHING_TOP_K * 2]
+
+    print(f"\n--- [낚시 RAG 검색 결과] 지역: {place or '전체'} / 질문: {question} ---")
+    for i, (doc, score) in enumerate(ranked):
+        print(f"[{i+1}위] 점수: {score:.4f} | 출처: {doc.metadata.get('source', '알 수 없음')}")
+    print("--------------------------------------------\n")
+
+    # 최고 점수가 기준에 못 미치면 '문서에 근거 없음'으로 보고 LLM 일반지식 모드로 넘긴다.
+    top_score = ranked[0][1] if ranked else 0.0
+    if not ranked or top_score < FISHING_MIN_SCORE:
+        print(f"[낚시 RAG] 관련 문서 없음 (최고점수 {top_score:.4f}) -> LLM 일반지식으로 답변합니다.")
+        return {"context": "", "sources": "", "mode": "llm"}
+
+    sources = ", ".join(sorted({d.metadata.get("source", "알 수 없음") for d, _ in ranked}))
+    return {
+        "context": "\n\n".join(doc.page_content for doc, _ in ranked),
+        "sources": sources,
+        "mode": "rag",
+    }
+
+
+def fishing_generate_node(state: FishingRAGState) -> FishingRAGState:
+    """[Fishing Generate]: 참고 문서가 있으면 RAG 프롬프트로, 없으면 일반지식 프롬프트로 답한다."""
+    place = " ".join(x for x in (state.get("region", ""), state.get("city", "")) if x).strip()
+    history = to_lc_messages(state.get("history"))
+    context = state.get("context", "")
+    mode = "rag" if context else "llm"
+
+    template = prompt_template_fishing if mode == "rag" else prompt_template_fishing_general
+    payload = {
+        "place": place or "대한민국 전체",
+        "history": history,
+        "question": state["question"],
+    }
+    if mode == "rag":
+        payload["context"] = context
+    else:
+        # 검색을 껐을 때와, 검색했는데 근거를 못 찾았을 때를 구분해 안내한다.
+        payload["fallback_reason"] = (
+            "업로드된 낚시 자료에서 관련 내용을 찾지 못해 일반 지식으로 안내합니다."
+            if state.get("use_rag", True)
+            else "자료 검색(RAG)을 끈 상태라 모델의 일반 지식으로 안내합니다."
+        )
+
+    response = (template | llm).invoke(payload)
+    return {"answer": response.content, "mode": mode}
+
+
+def route_fishing(state: FishingRAGState) -> str:
+    """use_rag 플래그에 따라 검색 노드를 탈지 결정한다."""
+    return "retrieve" if state.get("use_rag", True) else "generate"
+
+
+def build_fishing_graph():
+    """낚시 지역 RAG 워크플로우(retrieve -> generate)를 구성해 컴파일한다."""
+    workflow = StateGraph(FishingRAGState)
+    workflow.add_node("retrieve", fishing_retrieve_node)
+    workflow.add_node("generate", fishing_generate_node)
+    workflow.add_conditional_edges(START, route_fishing,
+                                   {"retrieve": "retrieve", "generate": "generate"})
+    workflow.add_edge("retrieve", "generate")
+    workflow.add_edge("generate", END)
+    return workflow.compile()
+
+
+def warmup_vectorstore():
+    """Chroma 인덱스 파일을 부팅 시점에 미리 만들어 둔다.
+
+    Chroma는 첫 쓰기 때 chroma_data/<컬렉션UUID>/ 폴더와 .bin 파일 4개를 '새로' 만든다.
+    이 파일 생성 이벤트가 Live Server 같은 개발용 정적 서버의 자동 새로고침을 건드려서,
+    서버 부팅 후 첫 질문 때만 웹페이지가 리로드되는(첫 화면으로 튕기는) 현상이 있었다.
+    부팅할 때 더미 문서를 넣었다 지워 인덱스 파일을 먼저 만들어 두면 첫 질문에서는
+    파일이 새로 생기지 않으므로 리로드가 발생하지 않는다.
+    """
+    try:
+        warm_id = "__warmup__"
+        vectorstore.add_documents(
+            [Document(page_content="워밍업용 임시 문서", metadata={"source": "__warmup__"})],
+            ids=[warm_id],
+        )
+        vectorstore.similarity_search("워밍업", k=1)
+        vectorstore.delete(ids=[warm_id])
+        print("   - Chroma 인덱스 예열 완료 (첫 질문 시 파일 신규 생성 없음)")
+    except Exception as e:
+        print(f"   - Chroma 인덱스 예열 실패(동작에는 영향 없음): {e}")
+
+
+# 답변 서식 규칙 (RAG 응답 / 일반지식 응답에 공통 적용)
+FISHING_FORMAT_RULES = (
+    "[출력 형식] 아래를 반드시 지키세요.\n"
+    "- 마크다운 기호(**, ##, 표, 코드블록)를 절대 쓰지 마세요.\n"
+    "- 소제목은 다음 네 개만, 이 순서로, 각각 한 줄에 단독으로 씁니다.\n"
+    "  ① 낚시 규제\n"
+    "  ② 추천 낚시터·포인트\n"
+    "  ③ 어종과 시기\n"
+    "  ④ 참고 팁\n"
+    "- 소제목 아래 각 항목은 '- '로 시작하는 한 줄로 쓰고, 줄 맨 앞에 장소나 대상 이름을 둡니다.\n"
+    "- 그 장소의 세부값은 두 칸 들여쓴 '  - 항목: 값' 형태로 한 단계만 더 씁니다.\n"
+    "- 한 줄은 최대 60자로 짧게 끊고, 한 줄에 여러 항목을 몰아 쓰지 마세요.\n"
+    "- 자료에 없는 소제목은 그 아래에 '- 자료 없음' 한 줄만 씁니다.\n"
+    "- 되묻는 제안('원하시면 ~해드릴까요?')이나 인사말은 쓰지 마세요.\n"
+    "- 후속 질문이라 일부 항목만 필요하면 그 소제목만 쓰세요.\n\n"
+    "[형식 예시]\n"
+    "① 낚시 규제\n"
+    "- 대포천 (지방하천) — 낚시금지구역\n"
+    "  - 구간: 상동면 금동초 앞 ~ 상동 IC 삼거리\n"
+    "  - 금지행위: 모든 형태의 낚시, 취사, 야영\n"
+    "  - 지정일: 2016-08-01 / 길이: 1.33km\n"
+)
+
+
+def init_fishing_prompt():
+    """낚시 지역 안내 전용 프롬프트 템플릿을 생성합니다."""
+    return ChatPromptTemplate.from_messages([
+        ("system", (
+            "당신은 대한민국 낚시 여행을 안내하는 AI 어시스턴트입니다.\n"
+            "[참고문서]는 공공데이터 기반의 낚시터 정보, 낚시금지·제한·통제구역, "
+            "갯바위/선상 낚시포인트, 해역별 어획 정보입니다.\n\n"
+            "규칙:\n"
+            "1. 사용자가 선택한 지역은 '{place}'입니다. [참고문서]에서 이 지역에 해당하는 내용을 "
+            "우선 사용하고, 다른 지역 내용은 섞지 마세요.\n"
+            "2. 해당 지역에 낚시금지·제한·통제구역이 있으면 반드시 답변 맨 앞에 먼저 안내하세요.\n"
+            "3. 낚시터·낚시포인트는 이름, 주소나 좌표, 주요어종, 이용요금처럼 "
+            "[참고문서]에 실제로 적힌 값만 그대로 사용하세요. 값을 지어내지 마세요.\n"
+            "4. [참고문서]에 그 지역 정보가 없으면 '제공된 자료에 해당 지역 정보가 없습니다.'라고 "
+            "밝힌 뒤, 자료에 있는 가장 가까운 지역을 대안으로 제시하세요.\n"
+            "5. 이전 대화가 있으면 그 맥락을 이어서 답하세요. '거기', '그럼 근처는' 같은 "
+            "후속 질문은 직전에 이야기한 지역·장소를 가리킵니다.\n\n"
+            + FISHING_FORMAT_RULES +
+            "\n[참고문서]\n\n"
+            "{context}"
+        )),
+        MessagesPlaceholder("history"),
+        ("user", "{question}")
+    ])
+
+
+def init_fishing_general_prompt():
+    """업로드 문서를 근거로 쓰지 못할 때 사용하는 일반지식 프롬프트."""
+    return ChatPromptTemplate.from_messages([
+        ("system", (
+            "당신은 대한민국 낚시 여행을 안내하는 AI 어시스턴트입니다.\n"
+            "지금은 업로드된 낚시 자료를 참고하지 않고 모델의 일반 지식으로 답하는 상황입니다.\n\n"
+            "규칙:\n"
+            "1. 사용자가 선택한 지역은 '{place}'입니다.\n"
+            "2. 답변 첫 줄에 '{fallback_reason}'라고 먼저 밝히세요.\n"
+            "3. 낚시금지구역·이용요금·좌표처럼 최신 고시나 실제 데이터가 필요한 값은 단정하지 "
+            "말고, 확인해야 할 기관(시·군청 담당부서, 공공데이터포털 등)을 함께 안내하세요.\n"
+            "4. 이전 대화가 있으면 그 맥락을 이어서 답하세요.\n\n"
+            + FISHING_FORMAT_RULES
+        )),
+        MessagesPlaceholder("history"),
+        ("user", "{question}")
+    ])
+
+
+# ==========================================
 # [헬퍼 함수] 문서 추출, 청킹, DB 적재
 # ==========================================
 def extract_documents(file_path: Path) -> list[Document]:
@@ -238,6 +462,7 @@ def init_prompt_templates():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global embeddings, llm, vectorstore, prompt_template, prompt_template_general, rag_workflow
+    global prompt_template_fishing, prompt_template_fishing_general, fishing_workflow
     print("1. AI 모델 및 클라이언트 초기화 중...")
 
     # LangChain ChatOpenAI 초기화 (base_url 지원)
@@ -262,6 +487,12 @@ async def lifespan(app: FastAPI):
     # LangGraph 워크플로우 구성 및 컴파일
     print("2. LangGraph RAG 워크플로우 빌드 중...")
     rag_workflow = build_rag_graph()
+
+    # 낚시 지역 RAG 프롬프트 / 워크플로우 초기화
+    prompt_template_fishing = init_fishing_prompt()
+    prompt_template_fishing_general = init_fishing_general_prompt()
+    fishing_workflow = build_fishing_graph()
+    warmup_vectorstore()
     print("준비 완료! 서버가 시작되었습니다.")
     yield
     print("서버가 종료됩니다.")
@@ -293,6 +524,14 @@ setup_cors(app)
 class ChatReq(BaseModel):
     message: str
     use_rag: bool = False     # 기본값으로 RAG 사용을 활성화
+
+class FishingChatReq(BaseModel):
+    """index_fishing.html 전용 요청 스키마 (지도에서 고른 지역과 대화 기록이 함께 전달된다)"""
+    message: str
+    region: str = ""          # 선택한 시/도 (예: 경상남도)
+    city: str = ""            # 선택한 시/군/구 (예: 김해시)
+    use_rag: bool = True      # False면 검색을 건너뛰고 LLM 일반지식으로만 답한다
+    history: list = []        # 이전 대화 [{"role": "user"|"assistant", "content": "..."}]
 
 # ==========================================
 # [CORS 테스트 API] Simple vs Preflight 실습
@@ -387,6 +626,119 @@ def reset_db():
         return {"success": True, "message": "Chroma DB 데이터가 완전히 초기화되었습니다."}
     except Exception as e:
         return {"success": False, "message": f"DB 초기화 중 오류 발생: {str(e)}"}
+
+# ==========================================
+# [API 4] 다중 파일 업로드 (index_fishing.html 전용, 최대 15개)
+#  - 기존 /upload는 그대로 두고, 여러 TXT를 한 번에 올릴 수 있는 엔드포인트를 추가한다.
+# ==========================================
+MAX_UPLOAD_FILES = 15
+
+@app.post("/upload-multi")
+def upload_files(files: list[UploadFile] = File(...)):
+    allowed_extensions = {".txt", ".md", ".pdf"}
+
+    if not files:
+        return {"success": False, "message": "업로드할 파일이 없습니다.", "results": []}
+    if len(files) > MAX_UPLOAD_FILES:
+        return {
+            "success": False,
+            "message": f"한 번에 최대 {MAX_UPLOAD_FILES}개까지 업로드할 수 있습니다. "
+                       f"(요청: {len(files)}개)",
+            "results": []
+        }
+
+    results = []
+    total_chunks = 0
+    for file in files:
+        file_ext = Path(file.filename).suffix.lower()
+        if file_ext not in allowed_extensions:
+            results.append({
+                "filename": file.filename,
+                "success": False,
+                "chunks_added": 0,
+                "message": f"지원하지 않는 형식 ({', '.join(sorted(allowed_extensions))} 만 허용)"
+            })
+            continue
+        try:
+            # 파일을 data 폴더에 백업 저장
+            save_path = DATA_DIR / file.filename
+            with open(save_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            docs = extract_documents(file_path=save_path)
+            if not docs:
+                results.append({
+                    "filename": file.filename,
+                    "success": False,
+                    "chunks_added": 0,
+                    "message": "파일 내용이 없거나 읽을 수 없습니다."
+                })
+                continue
+
+            chunks_added = add_to_db(chunk_documents(docs))
+            total_chunks += chunks_added
+            results.append({
+                "filename": file.filename,
+                "success": True,
+                "chunks_added": chunks_added,
+                "message": f"{chunks_added}개 청크 추가"
+            })
+        except Exception as e:
+            results.append({
+                "filename": file.filename,
+                "success": False,
+                "chunks_added": 0,
+                "message": f"처리 중 오류: {str(e)}"
+            })
+
+    ok_count = sum(1 for r in results if r["success"])
+    return {
+        "success": ok_count > 0,
+        "message": f"{len(files)}개 중 {ok_count}개 업로드 완료 (총 {total_chunks}개 청크 추가)",
+        "total_chunks": total_chunks,
+        "results": results
+    }
+
+# ==========================================
+# [API 5] 낚시 지역 RAG 채팅 (index_fishing.html 전용)
+#  - 지도에서 고른 도/시가 검색 쿼리와 프롬프트에 함께 들어간다.
+# ==========================================
+@app.post("/fishing-chat")
+def fishing_chat(req: FishingChatReq):
+    initial_state = {
+        "question": req.message,
+        "region": req.region or "",
+        "city": req.city or "",
+        "history": req.history or [],
+        "use_rag": req.use_rag,
+        "context": "",
+        "sources": "",
+        "mode": "",
+        "answer": ""
+    }
+
+    try:
+        final_state = fishing_workflow.invoke(initial_state)
+    except Exception as e:
+        return {
+            "success": False,
+            "answer": f"답변 생성 중 오류가 발생했습니다: {str(e)}",
+            "mode": "error",
+            "source": None,
+            "model": GPT_MODEL,
+            "region": " ".join(x for x in (req.region, req.city) if x)
+        }
+
+    mode = final_state.get("mode") or "llm"
+    return {
+        "success": True,
+        "answer": final_state["answer"],
+        "mode": mode,                                   # "rag" | "llm"
+        "rag_searched": req.use_rag,                    # llm일 때 '검색 실패'인지 '검색 끔'인지 구분
+        "source": final_state.get("sources") or None,   # rag일 때만 파일명 목록
+        "model": GPT_MODEL,
+        "region": " ".join(x for x in (req.region, req.city) if x)
+    }
 
 
 if __name__ == "__main__":
